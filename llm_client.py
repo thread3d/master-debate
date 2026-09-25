@@ -1,6 +1,21 @@
-import time
-from typing import Optional
+import re
+
 import requests
+
+
+def _strip_thinking(text: str) -> str:
+    """Strip model reasoning blocks from a reply.
+
+    Handles complete blocks, an unclosed opening tag, and the orphan
+    closing tag some servers emit after stripping the opening tag.
+    """
+    # Complete <think>...</think> blocks
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    # A stray closing tag with no opener: everything before it was reasoning
+    text = re.sub(r"^.*</think>", "", text, flags=re.DOTALL)
+    # An unclosed opening tag: drop everything from it onward
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip()
 
 
 class LLMClient:
@@ -8,12 +23,26 @@ class LLMClient:
         self,
         base_url: str = "http://localhost:11434",
         model: str = "qwen3-coder-next:q8_0",
+        timeout: float = 3000,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.timeout = 3000
+        self.timeout = timeout
 
-    def generate(self, prompt: str, system_prompt: str = "") -> Optional[str]:
+    @staticmethod
+    def _decode(response) -> dict | None:
+        """Parse a JSON object from a response body.
+
+        Returns None for bodies that are not a JSON object, so callers can treat
+        malformed responses the same way they treat transport failures.
+        """
+        try:
+            result = response.json()
+        except ValueError:
+            return None
+        return result if isinstance(result, dict) else None
+
+    def generate(self, prompt: str, system_prompt: str = "") -> str | None:
         try:
             payload = {
                 "model": self.model,
@@ -28,27 +57,16 @@ class LLMClient:
             )
             response.raise_for_status()
 
-            result = response.json()
-            response_text = result.get("response", "").strip()
-
-            # Remove thinking tags and content between them
-            import re
-
-            # Remove <think>...</think> tags and everything between them
-            response_text = re.sub(
-                r"<think>.*?</think>", "", response_text, flags=re.DOTALL
-            )
-            # Also remove any remaining thinking tags that might not be properly closed
-            response_text = re.sub(r"<think>.*", "", response_text, flags=re.DOTALL)
-            response_text = response_text.strip()
-
-            return response_text
+            result = self._decode(response)
+            if result is None:
+                return None
+            return _strip_thinking(result.get("response") or "")
 
         except requests.exceptions.RequestException as e:
             print(f"Error calling LLM: {e}")
             return None
 
-    def chat(self, model: str, messages: list) -> Optional[str]:
+    def chat(self, model: str, messages: list) -> str | None:
         try:
             payload = {
                 "model": model,
@@ -62,8 +80,12 @@ class LLMClient:
             )
             response.raise_for_status()
 
-            result = response.json()
-            return result.get("message", {}).get("content", "").strip()
+            result = self._decode(response)
+            if result is None:
+                return None
+            message = result.get("message") or {}
+            content = message.get("content") if isinstance(message, dict) else ""
+            return _strip_thinking(content or "")
 
         except requests.exceptions.RequestException as e:
             print(f"Error calling LLM: {e}")
