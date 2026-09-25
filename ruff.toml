@@ -3,6 +3,6 @@ line-length = 100
 
 [lint]
 select = ["E4", "E7", "E9", "F", "I", "UP", "B", "BLE", "TRY", "DTZ"]
-
-[lint.per-file-ignores]
-"tests/*" = ["TRY003"]
+# TRY003 wants exception messages baked into dedicated exception classes; this
+# project raises descriptive errors meant for the user, so the rule is noise.
+ignore = ["TRY003"]

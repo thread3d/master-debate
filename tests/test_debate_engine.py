@@ -1,5 +1,6 @@
 import debate_engine
-from debate_engine import PhilosopherDebate
+from debate_engine import DebateStopped, PhilosopherDebate
+from llm_client import LLMError
 
 
 class FakeClient:
@@ -259,3 +260,127 @@ def test_summary_returns_fallback_when_no_client_available():
     debate = PhilosopherDebate(["A"], "issue", {})
     debate.history = [{"turn": 0, "name": "A", "text": "hi"}]
     assert debate.get_summary() == "Debate completed."
+
+
+# --- backend failures -------------------------------------------------------
+
+
+class DeadClient:
+    def generate(self, prompt, system_prompt=""):
+        raise LLMError("could not reach http://localhost:11434")
+
+
+class FlakyClient:
+    def __init__(self, failures=1, text="recovered"):
+        self.failures = failures
+        self.text = text
+        self.calls = 0
+
+    def generate(self, prompt, system_prompt=""):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise LLMError("backend down")
+        return self.text
+
+
+class BrokenJudge:
+    def generate(self, prompt, system_prompt=""):
+        raise LLMError("judge offline")
+
+
+class StreamingClient:
+    def __init__(self, pieces):
+        self.pieces = list(pieces)
+
+    def generate(self, prompt, system_prompt=""):
+        return "".join(self.pieces)
+
+    def stream_generate(self, prompt, system_prompt=""):
+        buffer = ""
+        for piece in self.pieces:
+            buffer += piece
+            yield buffer
+
+
+def test_backend_failure_aborts_and_reports_the_error():
+    debate = PhilosopherDebate(["A", "B"], "issue", DeadClient())
+    result = debate.run_debate()
+    assert result["turns"] == 0
+    assert "could not reach" in result["error"]
+    assert result["failed_turns"] == 2
+    assert len(result["errors"]) == 2
+
+
+def test_transient_failure_is_tolerated_and_recorded():
+    # The first attempt fails and consumes a turn slot, so 3 max turns yields 2
+    # recorded turns plus one failure.
+    debate = PhilosopherDebate(["A", "B"], "issue", FlakyClient(failures=1), max_turns=3)
+    result = debate.run_debate()
+    assert result["turns"] == 2
+    assert result["failed_turns"] == 1
+
+
+def test_judge_failure_does_not_end_the_debate():
+    debate = PhilosopherDebate(
+        ["A", "B"],
+        "issue",
+        FakeClient(default="argument"),
+        judge_client=BrokenJudge(),
+        max_turns=3,
+    )
+    result = debate.run_debate()
+    assert result["turns"] == 3
+    # Consensus is re-checked every turn from the second onwards.
+    assert result["judge_errors"] == ["judge offline", "judge offline"]
+    assert result["consensus_reached"] is False
+
+
+def test_summary_reports_judge_failure():
+    debate = PhilosopherDebate(["A"], "issue", {}, judge_client=BrokenJudge())
+    debate.history = [{"turn": 0, "name": "A", "text": "hi"}]
+    assert debate.get_summary().startswith("Summary unavailable")
+
+
+# --- streaming and stopping -------------------------------------------------
+
+
+def test_streaming_callback_receives_partial_text():
+    debate = PhilosopherDebate(
+        ["A"], "issue", StreamingClient(["Hel", "lo ", "world"]), max_turns=1
+    )
+    seen = []
+    debate.run_debate(
+        on_chunk_callback=lambda name, text: seen.append((name, text))
+    )
+    assert seen == [("A", "Hel"), ("A", "Hello "), ("A", "Hello world")]
+    assert debate.history[0]["text"] == "Hello world"
+
+
+def test_stop_before_the_first_turn():
+    debate = PhilosopherDebate(["A"], "issue", FakeClient(), max_turns=5)
+    result = debate.run_debate(should_stop=lambda: True)
+    assert result["stopped"] is True
+    assert result["turns"] == 0
+
+
+def test_stop_request_ends_the_debate_after_a_turn():
+    calls = {"n": 0}
+
+    def should_stop():
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    debate = PhilosopherDebate(["A", "B"], "issue", FakeClient(default="NO"), max_turns=20)
+    result = debate.run_debate(should_stop=should_stop)
+    assert result["stopped"] is True
+    assert result["turns"] == 1
+
+
+def test_chunk_callback_can_abort_with_debate_stopped():
+    def abort(name, text):
+        raise DebateStopped
+
+    debate = PhilosopherDebate(["A"], "issue", StreamingClient(["a", "b"]), max_turns=5)
+    result = debate.run_debate(on_chunk_callback=abort)
+    assert result["stopped"] is True
+    assert result["turns"] == 0
