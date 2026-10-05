@@ -1,7 +1,24 @@
+import re
 import time
 
 from llm_client import LLMError
 from philosophers import philosophers
+
+_YES_NO = re.compile(r"\b(YES|NO)\b")
+
+
+def parse_consensus_verdict(response: str) -> bool:
+    """Interpret a judge reply as a consensus verdict.
+
+    The judge is asked to answer only YES or NO, but models routinely wrap the
+    word in prose ("Based on the debate, YES"), so requiring the reply to
+    merely *start* with YES silently missed genuine consensus. We match
+    standalone YES/NO tokens instead. A reply containing both ("I cannot say
+    YES or NO") is ambiguous and counts as no consensus: ending a debate early
+    on a misread is worse than letting it continue.
+    """
+    verdicts = _YES_NO.findall((response or "").upper())
+    return bool(verdicts) and all(verdict == "YES" for verdict in verdicts)
 
 
 class DebateStopped(Exception):
@@ -18,6 +35,7 @@ class PhilosopherDebate:
         max_turns: int = 20,
         time_limit_seconds: float | None = None,
         max_consecutive_failures: int = 2,
+        consensus_check_interval: int = 2,
     ):
         self.philosophers = list(philosophers)
         self.initial_issue = initial_issue
@@ -32,6 +50,9 @@ class PhilosopherDebate:
         # A backend that is down should fail fast rather than silently burning
         # through every turn, so we abort after this many failures in a row.
         self.max_consecutive_failures = max_consecutive_failures
+        # Consensus judging is a full extra model call, so it runs every N
+        # turns (and once on the final turn) rather than after every turn.
+        self.consensus_check_interval = max(1, consensus_check_interval)
         self.turn_count = 0
         self.errors: list[str] = []
         self.judge_errors: list[str] = []
@@ -160,9 +181,21 @@ class PhilosopherDebate:
             self.judge_errors.append(str(e))
             return False
 
-        if response:
-            return response.strip().upper().startswith("YES")
-        return False
+        return parse_consensus_verdict(response)
+
+    def _consensus_due(self) -> bool:
+        """Whether a consensus check should run after the current turn.
+
+        Requires at least two turns so there is something to compare, then
+        throttles to every ``consensus_check_interval`` turns. The final turn is
+        always checked so a debate that only converges at the end is still
+        recognised instead of being reported as "max turns reached".
+        """
+        if self.turn_count < 2:
+            return False
+        if self.turn_count >= self.max_turns:
+            return True
+        return self.turn_count % self.consensus_check_interval == 0
 
     def _format_full_history(self) -> str:
         if not self.history:
@@ -170,6 +203,10 @@ class PhilosopherDebate:
         return "\n".join(f"{e['name']}: {e['text']}" for e in self.history)
 
     def run_debate(self, on_turn_callback=None, on_chunk_callback=None, should_stop=None):
+        # Reset per-run state so an instance can be reused. Without clearing
+        # history, a second run would append to the first and produce duplicate
+        # turn numbers in reports.
+        self.history = []
         self.turn_count = 0
         self.errors = []
         self.judge_errors = []
@@ -231,11 +268,13 @@ class PhilosopherDebate:
                 )
 
                 if on_turn_callback:
-                    on_turn_callback(self.turn_count, philosopher_name, response)
+                    # Report the same turn index that history records, so the
+                    # two stay aligned even when earlier turns failed.
+                    on_turn_callback(turn, philosopher_name, response)
 
                 self.turn_count += 1
 
-                if self.turn_count >= 2 and self.check_consensus():
+                if self._consensus_due() and self.check_consensus():
                     return {
                         "consensus_reached": True,
                         "turns": self.turn_count,

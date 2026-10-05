@@ -9,10 +9,11 @@ A Python application that orchestrates debates between multiple LLMs, each embod
 - **LLM Integration** with Ollama or compatible APIs
 - **Automatic Model Discovery** from `/api/tags`, plus a Custom option for any name
 - **Streaming Output** — responses appear as they are generated, with a working Stop button
-- **Consensus Detection** using a judgment-based approach
-- **Independent Judge Model** for consensus checks and summaries
+- **Consensus Detection** by an independent judge, checked every 2 turns and always on the final turn
+- **Independent Judge Model** for consensus checks and summaries, run at temperature 0 so the same debate gets the same verdict
 - **Time & Turn Limits** — the debate stops at the configured duration or after 20 turns
 - **Clear Failure Reporting** — an unreachable backend or a missing model is shown, not swallowed
+- **Crash-Safe Storage** — settings and saved debates are written atomically, so a reader never sees a half-written file
 - **Streamlit Web UI** for easy interaction
 
 ## Setup
@@ -51,7 +52,7 @@ streamlit run app.py
 4. **Choose Models**: Pick from the models discovered on your server, or type a custom name
 5. **Choose a Judge**: Optionally pick a separate model for the consensus/summary calls
 6. **Start Debate**: Watch the arguments stream in turn by turn; press Stop to end early
-7. **Consensus Check**: After each turn, the judge model evaluates if consensus was reached
+7. **Consensus Check**: Every 2 turns — and always on the final turn — the judge model evaluates whether consensus was reached
 8. **Review Results**: See the outcome, statistics, summary and full history
 
 ## Philosophy Personalities
@@ -72,12 +73,26 @@ Each philosopher has a unique personality defined by their core philosophical pr
 - **Model Names**: Discovered from the provider's `/api/tags`; if the server is
   unreachable the built-in list is used, and *Custom…* accepts any name
 - **Judge Model**: Model used for the consensus and summary calls (defaults to the selected LLM model)
+- **Judge Temperature**: 0.0 — the judge only classifies and summarises, so it runs greedily
 - **Per-philosopher overrides**: Off by default; enables a provider/model per philosopher
 - **Time Limit**: The debate stops once this duration elapses (default 30 minutes)
 - **Max Turns**: 20 turns maximum per debate
-- **Temperature**: 0.7 (balanced creativity/rationality)
+- **Consensus Check Interval**: Every 2 turns, plus the final turn (judging is a full extra model call)
+- **Temperature**: 0.7 (balanced creativity/rationality) for the debating philosophers
 - **Response Length**: 512 tokens per turn
+- **Request Timeouts**: 5 seconds to connect, 10 minutes to read a response
 - **Python**: 3.11 or newer
+
+## Storage
+
+- `debate_settings.json` holds the saved configuration and `debates_data/` holds
+  finished debates. Both paths can be redirected with the
+  `MASTER_DEBATE_SETTINGS_FILE` and `MASTER_DEBATE_DEBATES_DIR` environment
+  variables.
+- Writes go to a temporary file and are moved into place with `os.replace`, and
+  settings access is serialised by a lock. Every Streamlit session in a process
+  shares these files, so a file is never left half-written, but the last session
+  to change a setting still wins.
 
 ## Tips
 
@@ -100,4 +115,4 @@ LLM backend.
 
 ## License
 
-MIT License - feel free to modify and extend!
+MIT License — see [LICENSE](LICENSE) for details. Feel free to modify and extend!

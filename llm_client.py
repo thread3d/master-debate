@@ -52,11 +52,24 @@ class LLMClient:
         self,
         base_url: str = "http://localhost:11434",
         model: str = "qwen3-coder-next:q8_0",
-        timeout: float = 3000,
+        timeout: float = 600,
+        connect_timeout: float = 5,
+        temperature: float = 0.7,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        # ``timeout`` is the read timeout: how long the server may go silent
+        # mid-response. It is deliberately generous because a large model on
+        # CPU can legitimately think for minutes. ``connect_timeout`` is kept
+        # short so an unreachable host fails fast instead of hanging a worker.
         self.timeout = timeout
+        self.connect_timeout = connect_timeout
+        self.temperature = temperature
+
+    @property
+    def request_timeout(self) -> tuple[float, float]:
+        """The ``requests`` (connect, read) timeout pair used for every call."""
+        return (self.connect_timeout, self.timeout)
 
     @staticmethod
     def _decode(response) -> dict | None:
@@ -76,7 +89,7 @@ class LLMClient:
             response = requests.post(
                 f"{self.base_url}{path}",
                 json=payload,
-                timeout=self.timeout,
+                timeout=self.request_timeout,
                 stream=stream,
             )
             response.raise_for_status()
@@ -102,7 +115,11 @@ class LLMClient:
             "prompt": prompt,
             "system": system_prompt,
             "stream": stream,
-            "options": {"temperature": 0.7, "top_p": 0.9, "num_predict": 512},
+            "options": {
+                "temperature": self.temperature,
+                "top_p": 0.9,
+                "num_predict": 512,
+            },
         }
 
     def generate(self, prompt: str, system_prompt: str = "") -> str:
@@ -155,7 +172,11 @@ class LLMClient:
             "model": model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.7, "top_p": 0.9, "num_predict": 512},
+            "options": {
+                "temperature": self.temperature,
+                "top_p": 0.9,
+                "num_predict": 512,
+            },
         }
         response = self._post("/api/chat", payload)
         result = self._decode(response)

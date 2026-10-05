@@ -1,5 +1,7 @@
 import json
 import os
+import tempfile
+import threading
 import time
 from datetime import UTC, datetime
 
@@ -16,10 +18,20 @@ MIN_PHILOSOPHERS = 2
 MAX_PHILOSOPHERS = 5
 POLL_INTERVAL_SECONDS = 0.4
 
+# The judge only classifies (consensus yes/no) and summarises, so it runs
+# greedily: a sampling judge gives different verdicts for identical debates.
+JUDGE_TEMPERATURE = 0.0
+
 # File locations are module-level so tests (and deployments) can redirect them,
 # and so importing the app never writes to the filesystem.
 SETTINGS_FILE = os.environ.get("MASTER_DEBATE_SETTINGS_FILE", "debate_settings.json")
 DEBATES_DIR = os.environ.get("MASTER_DEBATE_DEBATES_DIR", "debates_data")
+
+# Streamlit serves every browser session from one process, so the settings file
+# is shared mutable state between sessions. This lock serialises the
+# read-modify-write cycle; atomic writes then keep readers from seeing a
+# half-written file.
+SETTINGS_LOCK = threading.Lock()
 
 CUSTOM_OPTION = "Custom…"
 
@@ -74,9 +86,9 @@ def render_debate_outcome(result: dict) -> None:
     getattr(st, level)(message)
 
 
-def load_settings():
-    """Load settings from file if exists"""
-    default_settings = {
+def default_settings():
+    """The settings used when nothing has been saved yet."""
+    return {
         "base_url": "http://localhost:11434",
         "selected_model": "qwen3-coder-next:q8_0",
         "judge_model": "qwen3-coder-next:q8_0",
@@ -85,28 +97,80 @@ def load_settings():
         "time_limit": DEFAULT_TIME_LIMIT_MINUTES,
     }
 
-    if os.path.exists(SETTINGS_FILE):
+
+def _read_text(path):
+    """Return a file's text, or "" when it is missing or unreadable."""
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _atomic_write_text(path, text):
+    """Write text to ``path`` atomically.
+
+    A crash (or a concurrent reader) must never observe a half-written settings
+    or debate file, so the content goes to a temporary file in the same
+    directory and is then moved into place with ``os.replace``.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        # Leave no debris behind if the write fails partway through.
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+
+def load_settings():
+    """Load settings from file if exists"""
+    defaults = default_settings()
+
+    with SETTINGS_LOCK:
+        if not os.path.exists(SETTINGS_FILE):
+            return defaults
         try:
             with open(SETTINGS_FILE) as f:
                 loaded_settings = json.load(f)
-                # Merge with defaults to ensure all keys exist
-                for key, value in default_settings.items():
-                    if key not in loaded_settings:
-                        loaded_settings[key] = value
-                return loaded_settings
         except (OSError, json.JSONDecodeError) as e:
             st.error(f"Error loading settings: {e}")
-            return default_settings
-    else:
-        return default_settings
+            return defaults
+
+    if not isinstance(loaded_settings, dict):
+        st.error("Error loading settings: expected a JSON object")
+        return defaults
+
+    # Merge with defaults to ensure all keys exist
+    for key, value in defaults.items():
+        if key not in loaded_settings:
+            loaded_settings[key] = value
+    return loaded_settings
 
 
 def save_settings(settings):
-    """Save settings to file"""
+    """Save settings to file, skipping writes that change nothing"""
     try:
-        with open(SETTINGS_FILE, "w") as f:
-            json.dump(settings, f, indent=2)
-    except (OSError, TypeError, ValueError) as e:
+        payload = json.dumps(settings, indent=2)
+    except (TypeError, ValueError) as e:
+        st.error(f"Error saving settings: {e}")
+        return
+
+    try:
+        with SETTINGS_LOCK:
+            if _read_text(SETTINGS_FILE) == payload:
+                return
+            _atomic_write_text(SETTINGS_FILE, payload)
+    except OSError as e:
         st.error(f"Error saving settings: {e}")
 
 
@@ -119,9 +183,8 @@ def save_debate(debate_data):
     filename = f"debate_{safe_timestamp}.json"
     filepath = os.path.join(DEBATES_DIR, filename)
     try:
-        os.makedirs(DEBATES_DIR, exist_ok=True)
-        with open(filepath, "w") as f:
-            json.dump(debate_data, f, indent=2)
+        payload = json.dumps(debate_data, indent=2)
+        _atomic_write_text(filepath, payload)
     except (OSError, TypeError, ValueError) as e:
         st.error(f"Error saving debate: {e}")
 
@@ -232,7 +295,9 @@ def render_debate_report(results):
             f"⚠️ {result['failed_turns']} turn(s) failed to generate. "
             f"Last error: {last_error}"
         )
-    elif result.get("judge_errors"):
+    if result.get("judge_errors"):
+        # Reported independently: a debate can have both failed turns and a
+        # failed judge, and hiding the second behind an elif lost information.
         st.warning(f"⚠️ Consensus check failed: {result['judge_errors'][-1]}")
 
     st.subheader("📊 Statistics")
@@ -298,7 +363,11 @@ def build_clients(selected_phi, philosopher_settings, settings):
         else:
             llm_clients[philosopher] = LLMClient(base_url, default_model)
 
-    judge_client = LLMClient(base_url, settings.get("judge_model", default_model))
+    judge_client = LLMClient(
+        base_url,
+        settings.get("judge_model", default_model),
+        temperature=JUDGE_TEMPERATURE,
+    )
     return llm_clients, judge_client
 
 

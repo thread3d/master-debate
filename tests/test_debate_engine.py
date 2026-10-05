@@ -1,3 +1,5 @@
+import pytest
+
 import debate_engine
 from debate_engine import DebateStopped, PhilosopherDebate
 from llm_client import LLMError
@@ -142,6 +144,61 @@ def test_judge_falls_back_to_a_philosopher_when_not_injected():
     assert any("Has consensus been reached" in p for p in prompts(client))
 
 
+# --- consensus verdict parsing ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "reply,expected",
+    [
+        ("YES", True),
+        ("yes", True),
+        ("Yes.", True),
+        ("YES, they agree", True),
+        ("Based on the debate, YES", True),
+        ("NO", False),
+        ("No consensus yet", False),
+        ("", False),
+        ("The judge is undecided", False),
+        # Mixed verdicts are ambiguous, so the debate keeps going rather than
+        # ending on a misread.
+        ("I cannot answer YES or NO", False),
+        ("Yes, but also no", False),
+        # Must be a whole word, not a substring.
+        ("YESTERDAY they agreed", False),
+    ],
+)
+def test_parse_consensus_verdict(reply, expected):
+    assert debate_engine.parse_consensus_verdict(reply) is expected
+
+
+def test_consensus_is_checked_on_an_interval_not_every_turn():
+    client = FakeClient(default="NO")
+    debate = PhilosopherDebate(
+        ["A", "B"], "issue", client, max_turns=6, consensus_check_interval=3
+    )
+    debate.run_debate()
+    checks = sum("Has consensus been reached" in p for p in prompts(client))
+    # Turns 3 and 6, instead of every turn from 2 onwards (which would be 5).
+    assert checks == 2
+
+
+def test_final_turn_is_judged_even_when_off_interval():
+    client = FakeClient(default="NO")
+    debate = PhilosopherDebate(
+        ["A", "B"], "issue", client, max_turns=5, consensus_check_interval=3
+    )
+    debate.run_debate()
+    checks = sum("Has consensus been reached" in p for p in prompts(client))
+    assert checks == 2  # turn 3 (interval) and turn 5 (final turn)
+
+
+def test_consensus_check_interval_is_clamped_to_at_least_one():
+    debate = PhilosopherDebate(
+        ["A"], "issue", FakeClient(), consensus_check_interval=0
+    )
+    assert debate.consensus_check_interval == 1
+
+
 # --- termination paths ------------------------------------------------------
 
 
@@ -155,6 +212,18 @@ def test_max_turns_termination():
         "max_turns_reached": True,
     }
     assert len(debate.history) == 4
+
+
+def test_run_debate_resets_history_between_runs():
+    debate = PhilosopherDebate(["A", "B"], "issue", FakeClient(default="NO"), max_turns=2)
+    debate.run_debate()
+    first_run = list(debate.history)
+    assert first_run
+
+    debate.run_debate()
+    # A reused instance must not append to the previous run's history.
+    assert debate.history == first_run
+    assert [entry["turn"] for entry in debate.history] == [0, 1]
 
 
 def test_run_debate_without_philosophers_returns_error():
@@ -211,6 +280,17 @@ def test_on_turn_callback_receives_each_turn():
     debate.run_debate(on_turn_callback=lambda n, name, text: seen.append((n, name, text)))
     assert [n for n, _, _ in seen] == [0, 1, 2]
     assert [name for _, name, _ in seen] == ["A", "B", "A"]
+
+
+def test_turn_callback_index_matches_history_after_a_failure():
+    # The first attempt fails and consumes a turn slot, so the callback index
+    # must follow the recorded turn numbers rather than a successful-turn count.
+    debate = PhilosopherDebate(
+        ["A", "B"], "issue", FlakyClient(failures=1, text="recovered"), max_turns=3
+    )
+    seen = []
+    debate.run_debate(on_turn_callback=lambda n, name, text: seen.append(n))
+    assert seen == [entry["turn"] for entry in debate.history]
 
 
 def test_empty_responses_are_not_recorded():

@@ -105,6 +105,39 @@ def test_debate_storage_roundtrip(tmp_path, monkeypatch):
     assert [d["issue"] for d in app.load_all_debates()] == ["second", "first"]
 
 
+def test_save_settings_writes_atomically(tmp_path, monkeypatch):
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app, "SETTINGS_FILE", str(settings_file))
+
+    app.save_settings({"base_url": "http://x"})
+
+    assert settings_file.exists()
+    # The temporary file used for the atomic move must not survive the write.
+    assert [p.name for p in tmp_path.iterdir()] == ["settings.json"]
+
+
+def test_save_settings_skips_a_no_op_write(tmp_path, monkeypatch):
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr(app, "SETTINGS_FILE", str(settings_file))
+    app.save_settings({"base_url": "http://x"})
+    before = settings_file.stat().st_mtime_ns
+
+    app.save_settings({"base_url": "http://x"})
+
+    assert settings_file.stat().st_mtime_ns == before
+
+
+def test_save_debate_leaves_no_temporary_files(tmp_path, monkeypatch):
+    debates_dir = tmp_path / "debates"
+    monkeypatch.setattr(app, "DEBATES_DIR", str(debates_dir))
+
+    app.save_debate({"issue": "x", "timestamp": "2025-01-01T00:00:00"})
+
+    assert [p.name for p in debates_dir.iterdir()] == [
+        "debate_2025-01-01T00-00-00.json"
+    ]
+
+
 def test_save_debate_creates_missing_directory(tmp_path, monkeypatch):
     target = tmp_path / "nested" / "debates"
     monkeypatch.setattr(app, "DEBATES_DIR", str(target))
@@ -142,6 +175,31 @@ def test_display_debate_results_supports_nested_and_legacy(monkeypatch):
 
     assert fake_st.caption.called
     assert fake_st.warning.called
+
+
+def test_failed_turns_and_judge_errors_are_both_reported(monkeypatch):
+    fake_st = MagicMock()
+    fake_st.columns.return_value = [MagicMock(), MagicMock(), MagicMock()]
+    monkeypatch.setattr(app, "st", fake_st)
+
+    app.render_debate_report(
+        {
+            "result": {
+                "consensus_reached": False,
+                "turns": 1,
+                "max_turns_reached": True,
+                "failed_turns": 1,
+                "errors": ["backend down"],
+                "judge_errors": ["judge offline"],
+            },
+            "philosophers": ["Socrates"],
+            "history": [],
+        }
+    )
+
+    messages = [call.args[0] for call in fake_st.warning.call_args_list]
+    assert any("failed to generate" in message for message in messages)
+    assert any("Consensus check failed" in message for message in messages)
 
 
 def test_display_debate_results_error_outcome(monkeypatch):
@@ -182,6 +240,21 @@ def test_build_clients_ignores_overrides_when_disabled():
     assert clients["Socrates"].base_url == "http://global"
     assert clients["Socrates"].model == "global-model"
     assert judge.model == "judge-model"
+
+
+def test_build_clients_makes_the_judge_deterministic():
+    settings = {
+        "base_url": "http://global",
+        "selected_model": "global-model",
+        "judge_model": "judge-model",
+        "per_philosopher_overrides": False,
+    }
+
+    clients, judge = app.build_clients(["Socrates"], {}, settings)
+
+    assert judge.temperature == 0.0
+    # Debaters keep the creative default.
+    assert clients["Socrates"].temperature == 0.7
 
 
 def test_build_clients_applies_overrides_when_enabled():

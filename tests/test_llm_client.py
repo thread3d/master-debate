@@ -43,9 +43,14 @@ def test_base_url_trailing_slash_is_stripped():
     assert LLMClient("http://localhost:11434/").base_url == "http://localhost:11434"
 
 
-def test_default_timeout_and_override():
-    assert LLMClient().timeout == 3000
+def test_default_timeouts_and_override():
+    client = LLMClient()
+    assert client.timeout == 600
+    assert client.connect_timeout == 5
+    assert client.request_timeout == (5, 600)
+
     assert LLMClient(timeout=12).timeout == 12
+    assert LLMClient(timeout=12, connect_timeout=1).request_timeout == (1, 12)
 
 
 # --- generate ---------------------------------------------------------------
@@ -67,7 +72,41 @@ def test_generate_sends_ollama_payload(monkeypatch):
     assert captured["payload"]["prompt"] == "the prompt"
     assert captured["payload"]["system"] == "the system"
     assert captured["payload"]["stream"] is False
-    assert captured["timeout"] == 42
+    assert captured["timeout"] == (5, 42)
+
+
+def test_temperature_defaults_to_balanced_and_is_sent(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, stream=False):
+        captured.update(payload=json)
+        return FakeResponse({"response": "x"})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    LLMClient().generate("p")
+    assert captured["payload"]["options"]["temperature"] == 0.7
+
+    LLMClient(temperature=0.0).generate("p")
+    assert captured["payload"]["options"]["temperature"] == 0.0
+
+
+def test_stream_and_chat_use_the_configured_temperature(monkeypatch):
+    captured = {}
+
+    def fake_post(url, json=None, timeout=None, stream=False):
+        captured.update(payload=json)
+        return FakeResponse({}, lines=ndjson({"response": "x", "done": True}))
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    list(LLMClient(temperature=0.0).stream_generate("p"))
+    assert captured["payload"]["options"]["temperature"] == 0.0
+
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: FakeResponse({"message": {"content": "hi"}})
+    )
+    LLMClient(temperature=0.0).chat("m", [])
+    assert captured["payload"]["options"]["temperature"] == 0.0
 
 
 def test_generate_handles_missing_response_field(monkeypatch):
