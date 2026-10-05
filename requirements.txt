@@ -1,2 +1,7 @@
-streamlit
-requests
+# Runtime dependencies.
+#
+# Bounds are upper-capped at the next major release so an upstream breaking
+# change cannot alter a build without a commit here. The floor is the version
+# the test suite is run against.
+streamlit>=1.64,<2
+requests>=2.34,<3

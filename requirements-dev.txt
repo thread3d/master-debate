@@ -1,3 +1,6 @@
 -r requirements.txt
-pytest
+
+# Development and CI tooling. ruff is pinned exactly because lint results can
+# change between releases and should not fail a build without a commit here.
+pytest>=9.1,<10
 ruff==0.16.9
